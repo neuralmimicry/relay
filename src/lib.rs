@@ -188,6 +188,7 @@ pub struct Operation {
     pub version: u32,
     pub idempotency_key: String,
     pub work_id: String,
+    pub actor: String,
     pub connector: String,
     pub server: String,
     pub tool: String,
@@ -196,10 +197,8 @@ pub struct Operation {
 }
 pub fn approval_matches(work: &Value, op: &Operation) -> bool {
     work["execution_approved"] == true
-        && !matches!(
-            work["status"].as_str(),
-            Some("rejected" | "cancelled" | "completed" | "failed")
-        )
+        && work["id"] == op.work_id
+        && work["status"] == "in_operation"
         && work["plan"]["relay_operation"] == json!(op)
 }
 async fn execute(
@@ -208,6 +207,9 @@ async fn execute(
     Json(op): Json<Operation>,
 ) -> Result<Json<Value>> {
     let actor = app.authorize(&headers, "control").await?;
+    if op.actor != actor.principal {
+        return Err(ApiError::forbidden());
+    }
     require(
         op.version == 1
             && identifier(&op.idempotency_key)
@@ -379,14 +381,27 @@ mod tests {
             version: 1,
             idempotency_key: "k1".into(),
             work_id: "w1".into(),
+            actor: "alice".into(),
             connector: "refiner_mcp".into(),
             server: "erp".into(),
             tool: "update".into(),
             arguments: json!({"quantity":1}),
             source,
         };
-        let work =
-            json!({"execution_approved":true,"status":"approved","plan":{"relay_operation":op}});
+        let work = json!({"id":"w1","execution_approved":true,"status":"in_operation","plan":{"relay_operation":op}});
+        for state in [
+            "planned",
+            "scheduled",
+            "success",
+            "failure",
+            "aborted",
+            "on_hold",
+            "approved",
+        ] {
+            let mut closed = work.clone();
+            closed["status"] = json!(state);
+            assert!(!approval_matches(&closed, &op));
+        }
         assert!(approval_matches(&work, &op));
         op.arguments = json!({"quantity":2});
         assert!(!approval_matches(&work, &op));
