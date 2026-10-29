@@ -201,6 +201,23 @@ pub fn approval_matches(work: &Value, op: &Operation) -> bool {
         && work["status"] == "in_operation"
         && work["plan"]["relay_operation"] == json!(op)
 }
+
+/// Refiner preserves the JSON-RPC envelope returned by its MCP client inside
+/// its own `result` field. Older adapters return the tool result directly.
+/// Both shapes require an explicit successful tool result; ambiguous or
+/// protocol-level errors must remain subject to reconciliation.
+fn refiner_tool_succeeded(value: &Value) -> bool {
+    let Some(result) = value.get("result") else {
+        return false;
+    };
+    if result.get("jsonrpc").is_some() {
+        result["jsonrpc"] == "2.0"
+            && result.get("error").is_none()
+            && result.pointer("/result/isError") == Some(&json!(false))
+    } else {
+        result.get("isError") == Some(&json!(false))
+    }
+}
 async fn execute(
     State(app): State<App>,
     headers: HeaderMap,
@@ -279,7 +296,7 @@ async fn execute(
         Ok(value) => {
             // MCP protocol success may contain tool-level failure. Retain the
             // receipt without claiming completed business effects.
-            receipt["state"] = json!(if value.pointer("/result/isError") == Some(&json!(false)) {
+            receipt["state"] = json!(if refiner_tool_succeeded(&value) {
                 "completed"
             } else {
                 "reconciliation_required"
@@ -406,5 +423,26 @@ mod tests {
         op.arguments = json!({"quantity":2});
         assert!(!approval_matches(&work, &op));
         assert!(!approval_matches(&json!({"execution_approved":true}), &op));
+    }
+}
+#[test]
+fn actual_refiner_json_rpc_envelope_requires_explicit_tool_success() {
+    let success = json!({"result":{"jsonrpc":"2.0","id":"rpc-1",
+            "result":{"isError":false,"content":[{"type":"text","text":"observed"}]}}});
+    assert!(refiner_tool_succeeded(&success));
+    assert!(refiner_tool_succeeded(&json!({"result":{"isError":false}})));
+    let mut tool_error = success.clone();
+    tool_error["result"]["result"]["isError"] = json!(true);
+    assert!(!refiner_tool_succeeded(&tool_error));
+    let mut protocol_error = success.clone();
+    protocol_error["result"]["error"] = json!({"code":-32603});
+    assert!(!refiner_tool_succeeded(&protocol_error));
+    for ambiguous in [
+        json!({}),
+        json!({"result":{}}),
+        json!({"result":{"jsonrpc":"2.0","result":{"content":[]}}}),
+        json!({"result":{"jsonrpc":"1.0","result":{"isError":false}}}),
+    ] {
+        assert!(!refiner_tool_succeeded(&ambiguous));
     }
 }
