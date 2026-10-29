@@ -106,6 +106,11 @@ async fn ingest(
 struct Cursor {
     #[serde(default)]
     after: i64,
+    #[serde(default = "context_purpose")]
+    purpose: String,
+}
+fn context_purpose() -> String {
+    "context".into()
 }
 async fn changes(
     State(app): State<App>,
@@ -113,7 +118,10 @@ async fn changes(
     Query(cursor): Query<Cursor>,
 ) -> Result<Json<Value>> {
     let actor = app.authorize(&headers, "observe").await?;
-    require(cursor.after >= 0, "cursor")?;
+    require(
+        cursor.after >= 0 && identifier(&cursor.purpose),
+        "cursor and purpose",
+    )?;
     let rows = app
         .store
         .list(&actor.tenant, "change", cursor.after, 100)
@@ -134,7 +142,7 @@ async fn changes(
         .map_err(|_| ApiError::unavailable())?;
         // Denial events are delivered to their original readers to invalidate
         // caches; their data is null. Historical payloads obey current ACLs.
-        if current.permits(&actor, "context", now())
+        if current.permits(&actor, &cursor.purpose, now())
             || (current.deleted && source.readers.contains(&actor.principal))
         {
             permitted.push(if current.deleted {json!({"change":{"id":record["change"]["id"],"source":current,"data":null},"_sequence":record["_sequence"]})} else {record});
@@ -292,6 +300,19 @@ async fn receipt(
     let value = app.store.get(&actor.tenant, "receipt", &id).await?;
     if value["actor"] != actor.principal {
         return Err(ApiError::forbidden());
+    }
+    if value["purged"] != true {
+        let reference: SourceRef = serde_json::from_value(value["operation"]["source"].clone())
+            .map_err(|_| ApiError::unavailable())?;
+        let current: SourceRef = serde_json::from_value(
+            app.store
+                .get(&actor.tenant, "source", &reference.key())
+                .await?,
+        )
+        .map_err(|_| ApiError::unavailable())?;
+        if !current.permits(&actor, "execute", now()) {
+            return Err(ApiError::forbidden());
+        }
     }
     Ok(Json(value))
 }
